@@ -1,6 +1,4 @@
-# GraphRAG - Java Code Analysis Tool
-
-GraphRAG는 Java 소스 코드를 분석하고 Neo4j 그래프 데이터베이스에 저장하는 도구입니다. 이 도구는 Java 코드의 구조를 분석하고, 코드 간의 관계를 파악하며, GPT-4를 활용하여 코드에 대한 설명과 요약을 생성합니다.
+# Java Code Analysis Tool
 
 ## 주요 기능
 

@@ -1,6 +1,10 @@
 import os
 import sys
 from typing import List, Tuple, Optional
+import uuid # Added for unique IDs
+import json # Added for JSON operations
+import time # Added for polling sleep
+import openai # Added for OpenAI Batch API
 from tqdm import tqdm
 from py2neo import Graph, Node, Relationship
 from tree_sitter import Node
@@ -10,6 +14,7 @@ from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
+
 
 # Add project root to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -40,9 +45,175 @@ class JavaAnalyzer:
         self.batch_size = 1000
         self.pending_nodes = []
         self.pending_relationships = []
+        self.snippets_for_explanation = [] # Added for accumulating code snippets
+        self.openai_api_key = openai_api_key # Store for client initialization
+        self.openai_client = openai.OpenAI(api_key=self.openai_api_key) # Initialize OpenAI client
         self.llm = ChatOpenAI(model="gpt-4", temperature=0, api_key=openai_api_key)  # temperature를 0으로 설정하여 일관된 출력
         self.llm_parser = PydanticOutputParser(pydantic_object=CodeExplanation)
     
+    async def _batch_explain_code_snippets(self) -> None:
+        """Processes accumulated code snippets using the OpenAI Batch API."""
+        if not self.snippets_for_explanation:
+            print("No snippets to explain.")
+            return
+
+        batch_input_file_path = "batch_input.jsonl"
+        custom_id_to_node_map = {}
+        batch_requests = []
+
+        # Prepare format instructions once
+        format_instructions = self.llm_parser.get_format_instructions()
+        
+        # System message for the prompt
+        system_message_content = (
+            "당신은 숙련된 자바 개발자입니다. "
+            "사용자가 준 Java 코드를 읽고, 어떤 역할을 하는지 친절히 설명하고, "
+            "마지막에 한-두 줄로 핵심을 요약하세요. "
+            f"반드시 제공된 JSON 스키마에 맞춰 응답하세요.\n{format_instructions}"
+        )
+
+        for i, (graph_node, body_text) in enumerate(self.snippets_for_explanation):
+            custom_id = f"request-{uuid.uuid4()}" # More robust unique ID
+            custom_id_to_node_map[custom_id] = graph_node
+            
+            request_body = {
+                "model": "gpt-4", # Or self.llm.model_name if accessible and desired
+                "messages": [
+                    {"role": "system", "content": system_message_content},
+                    {"role": "user", "content": f"### Java 코드\n{body_text}\n\n### 출력 형식 지침\n{format_instructions}"} 
+                ],
+                "temperature": 0, # Or self.llm.temperature if accessible
+                "response_format": {"type": "json_object"},
+            }
+            
+            batch_requests.append({
+                "custom_id": custom_id,
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": request_body
+            })
+
+        try:
+            # Create and Upload Batch File
+            with open(batch_input_file_path, "w", encoding="utf-8") as f:
+                for req in batch_requests:
+                    f.write(json.dumps(req) + "\n")
+            
+            batch_input_file = self.openai_client.files.create(
+                file=open(batch_input_file_path, "rb"),
+                purpose="batch"
+            )
+            os.remove(batch_input_file_path) # Clean up local file
+
+            # Create Batch Job
+            batch_job = self.openai_client.batches.create(
+                input_file_id=batch_input_file.id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h"
+            )
+            print(f"Batch job created with ID: {batch_job.id}")
+
+            # Poll for Completion
+            start_time = time.time()
+            timeout_seconds = 3600  # 1 hour timeout for the entire batch job
+            polling_interval_seconds = 30 
+            max_retries = timeout_seconds // polling_interval_seconds
+
+            for i in range(max_retries):
+                batch_job = self.openai_client.batches.retrieve(batch_job.id)
+                print(f"Polling batch job status: {batch_job.status} (Attempt {i+1}/{max_retries})")
+                
+                if batch_job.status == 'completed':
+                    break
+                elif batch_job.status in ['failed', 'cancelled']:
+                    print(f"Batch job {batch_job.status}. Errors: {batch_job.errors}")
+                    self.snippets_for_explanation.clear() # Clear snippets even on failure
+                    return
+                
+                if time.time() - start_time > timeout_seconds:
+                    print("Batch job polling timed out.")
+                    self.openai_client.batches.cancel(batch_job.id) # Attempt to cancel
+                    self.snippets_for_explanation.clear()
+                    return
+                
+                time.sleep(polling_interval_seconds)
+            else: # Executed if the loop completes without break (max_retries reached)
+                print(f"Batch job did not complete after {max_retries} retries. Last status: {batch_job.status}")
+                if batch_job.status != 'completed': # Check if not completed despite loop finishing
+                   try:
+                       self.openai_client.batches.cancel(batch_job.id)
+                       print(f"Attempted to cancel batch job {batch_job.id}")
+                   except Exception as e_cancel:
+                       print(f"Error cancelling batch job {batch_job.id}: {e_cancel}")
+                self.snippets_for_explanation.clear()
+                return
+
+            # Process Results
+            if batch_job.status == 'completed' and batch_job.output_file_id:
+                output_file_id = batch_job.output_file_id
+                result_content_response = self.openai_client.files.content(output_file_id)
+                result_content = result_content_response.read().decode('utf-8')
+                
+                print("Batch job completed. Processing results...")
+                results_data = result_content.strip().split("\n")
+
+                for line in results_data:
+                    try:
+                        result_json = json.loads(line)
+                        custom_id = result_json.get("custom_id")
+                        graph_node = custom_id_to_node_map.get(custom_id)
+
+                        if not graph_node:
+                            print(f"Warning: No graph node found for custom_id {custom_id}")
+                            continue
+                        
+                        response_body = result_json.get("response", {}).get("body", {})
+                        if not response_body:
+                            print(f"Warning: Empty response body for custom_id {custom_id}")
+                            # Set default error message or skip
+                            graph_node.description = "Error processing snippet (empty response body)."
+                            graph_node.summary = "Processing error."
+                            self._add_to_batch(node=graph_node)
+                            continue
+
+                        message_content_str = response_body.get("choices", [{}])[0].get("message", {}).get("content")
+                        
+                        if not message_content_str:
+                            print(f"Warning: No message content for custom_id {custom_id}")
+                            graph_node.description = "Error processing snippet (no content)."
+                            graph_node.summary = "Processing error."
+                            self._add_to_batch(node=graph_node)
+                            continue
+
+                        # Parse the JSON string content into CodeExplanation model
+                        explanation = CodeExplanation.model_validate_json(message_content_str)
+                        graph_node.description = explanation.description
+                        graph_node.summary = explanation.summary
+                        self._add_to_batch(node=graph_node) # Add to Neo4j batch
+                        print(f"Updated node for custom_id {custom_id}")
+
+                    except json.JSONDecodeError as e_json:
+                        print(f"Error decoding JSON from result line: {line}. Error: {e_json}")
+                    except Exception as e_proc:
+                        print(f"Error processing result line {line}. Error: {e_proc}")
+                
+                print("Finished processing batch results.")
+            else:
+                print(f"Batch job completed but no output file ID or status is not 'completed'. Status: {batch_job.status}")
+
+        except openai.APIError as e:
+            print(f"OpenAI API error: {e}")
+        except IOError as e:
+            print(f"File IO error: {e}")
+            if os.path.exists(batch_input_file_path): # Ensure cleanup if file still exists
+                os.remove(batch_input_file_path)
+        except Exception as e:
+            print(f"An unexpected error occurred in _batch_explain_code_snippets: {e}")
+        finally:
+            self.snippets_for_explanation.clear() # Always clear the list
+            print("Snippets explanation list cleared.")
+
+
     def _get_explanation_code(self, body: str) -> Tuple[str, str]:
         """Get explanation of the code"""
         try:
@@ -312,14 +483,15 @@ class JavaAnalyzer:
     def _process_class_node(self, class_node: Node, leaf_package: JavaLeafPackage) -> None:
         """Process a class declaration node"""
         body = extract_text(class_node)
-        description, summary = self._get_explanation_code(body)
+        # description, summary = self._get_explanation_code(body) # Removed
         name_node = find_node_by_type_in_children(class_node, "identifier")
         if not name_node:
             return
         cls_name = extract_text(name_node)
-        java_class = self.get_or_create_class(class_name=cls_name, body=body, description=description, summary=summary)
+        java_class = self.get_or_create_class(class_name=cls_name, body=body, description="", summary="")
         java_class.contained_in.add(leaf_package)
         self._add_to_batch(node=java_class)
+        self.snippets_for_explanation.append((java_class, body)) # Added snippet
 
         for class_child_node in walk(class_node):
             self._process_class_child_node(class_child_node, java_class)
@@ -327,28 +499,30 @@ class JavaAnalyzer:
     def _process_interface_node(self, interface_node: Node, leaf_package: JavaLeafPackage) -> None:
         """Process a interface declaration node"""
         body = extract_text(interface_node)
-        description, summary = self._get_explanation_code(body)
+        # description, summary = self._get_explanation_code(body) # Removed
         name_node = find_node_by_type_in_children(interface_node, "identifier")
         if not name_node:
             return
 
         interface_name = extract_text(name_node)
-        java_interface = self.get_or_create_interface(interface_name, body=body, description=description, summary=summary)
+        java_interface = self.get_or_create_interface(interface_name, body=body, description="", summary="")
         java_interface.contained_in.add(leaf_package)
         self._add_to_batch(node=java_interface)
+        self.snippets_for_explanation.append((java_interface, body)) # Added snippet
 
     def _process_enum_node(self, enum_node: Node, leaf_package: JavaLeafPackage) -> None:
         """Process a enum declaration node"""
         body = extract_text(enum_node)
-        description, summary = self._get_explanation_code(body)
+        # description, summary = self._get_explanation_code(body) # Removed
         name_node = find_node_by_type_in_children(enum_node, "identifier")
         if not name_node:
             return
 
         enum_name = extract_text(name_node)
-        java_enum = self.get_or_create_enum(enum_name, body=body, description=description, summary=summary)
+        java_enum = self.get_or_create_enum(enum_name, body=body, description="", summary="")
         java_enum.contained_in.add(leaf_package)
         self._add_to_batch(node=java_enum)
+        self.snippets_for_explanation.append((java_enum, body)) # Added snippet
         
         for enum_child_node in walk(enum_node):
             self._process_enum_child_node(enum_child_node, java_enum)
@@ -387,7 +561,7 @@ class JavaAnalyzer:
     def _process_method_node(self, method_node: Node, java_class: JavaClass | JavaInterface) -> None:
         """Process a method declaration node"""
         body = extract_text(method_node)
-        description, summary = self._get_explanation_code(body)
+        # description, summary = self._get_explanation_code(body) # Removed
         name_node = find_node_by_type_in_children(method_node, "identifier")
         if not name_node:
             return
@@ -396,8 +570,22 @@ class JavaAnalyzer:
         return_type_node = find_node_by_type(method_node, "type_identifier")
         return_type = extract_text(return_type_node) if return_type_node else "void"
 
-        java_method = JavaMethod(method_name, body=body, description=description, summary=summary, return_type=return_type)
+        # Note: JavaMethod is directly instantiated, not using a get_or_create pattern here that takes all params.
+        # We need to ensure its direct instantiation handles description="" and summary="".
+        # The JavaMethod class definition would need to have default "" for description and summary,
+        # or be called as JavaMethod(method_name, body=body, description="", summary="", return_type=return_type)
+        # Assuming JavaMethod model is defined like:
+        # class JavaMethod(GraphObject):
+        #   name = Property()
+        #   body = Property()
+        #   description = Property()
+        #   summary = Property()
+        #   return_type = Property()
+        #   def __init__(self, name, body="", description="", summary="", return_type=""): ...
+        # Then the call below is fine.
+        java_method = JavaMethod(method_name, body=body, description="", summary="", return_type=return_type)
         self._add_to_batch(node=java_method)
+        self.snippets_for_explanation.append((java_method, body)) # Added snippet
 
         for param_node in walk(method_node):
             if param_node.type == "formal_parameters":
@@ -416,7 +604,7 @@ class JavaAnalyzer:
         self._add_to_batch(node=java_class)
     
 
-    def process_java_file(self, file_path: str) -> None:
+    async def process_java_file(self, file_path: str) -> None:
         """Process a single Java file"""
         try:
             source_code = self._read_source_code(file_path)
@@ -441,6 +629,8 @@ class JavaAnalyzer:
                     self._process_enum_node(node, leaf_package)
             # Flush any remaining pending nodes and relationships
             self._flush_batch()
+            # Note: The call to await self._batch_explain_code_snippets() has been removed from here.
+            # It will be called from main.py after all files are processed.
 
         except Exception as e:
             print(f"Error processing file {file_path}: {str(e)}")
@@ -535,6 +725,18 @@ class JavaAnalyzer:
             if tx:
                 self.graph.rollback(tx)
             print(f"Error merging duplicate packages: {str(e)}")
+
+# Example of how to run the analyzer and then the batch explanation
+# async def main_analysis_loop(analyzer, java_files_list):
+#     for java_file in tqdm(java_files_list, desc="Processing Java files"):
+#         analyzer.process_java_file(java_file)
+#     # After all files are processed, explain all collected snippets
+#     await analyzer._batch_explain_code_snippets()
+#     # Final flush to save any updated nodes from batch explanations
+#     analyzer._flush_batch() 
+#     # Merge duplicate packages if necessary
+#     analyzer.merge_duplicate_packages()
+
 
 def find_java_files(directory: str) -> List[str]:
     """Find all Java files in directory"""

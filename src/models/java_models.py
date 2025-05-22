@@ -19,6 +19,9 @@ class JavaInternalPackage(JavaPackage):
     name = Property()
     packages = RelatedFrom("JavaPackage", "CHILD_PACKAGE")
     package_by = RelatedTo("JavaPackage", "PARENT_PACKAGE")
+    classes = RelatedFrom("JavaClass", "CLASS")
+    interfaces = RelatedFrom("JavaInterface", "INTERFACE")
+    enums = RelatedFrom("JavaEnum", "ENUM")
 
     def __init__(self, name: str):
         super().__init__(name)
@@ -46,7 +49,7 @@ class JavaInterface(GraphObject):
     description = Property()
     summary = Property()
     extends = RelatedFrom("JavaInterface", "EXTEND")
-    contained_in = RelatedTo("JavaLeafPackage", "INTERFACE")
+    contained_in = RelatedTo("JavaPackage", "INTERFACE")
 
     def __init__(self, name: str, body: str, description: str, summary: str):
         self.name = name
@@ -66,7 +69,7 @@ class JavaClass(GraphObject):
     implements = RelatedTo("JavaInterface", "IMPLEMENT")
     fields = RelatedFrom("JavaField", "FIELD")
     methods = RelatedFrom("JavaMethod", "METHOD")
-    contained_in = RelatedTo("JavaLeafPackage", "CLASS")
+    contained_in = RelatedTo("JavaPackage", "CLASS")
 
     def __init__(self, name: str, body: str, description: str, summary: str):
         self.name = name
@@ -83,7 +86,7 @@ class JavaEnum(GraphObject):
     description = Property()
     summary = Property()
     constants = RelatedFrom("JavaEnumConstant", "CONSTANT")
-    contained_in = RelatedTo("JavaLeafPackage", "ENUM")
+    contained_in = RelatedTo("JavaPackage", "ENUM")
 
     def __init__(self, name: str, body: str, description: str, summary: str):
         self.name = name

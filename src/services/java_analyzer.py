@@ -447,6 +447,95 @@ class JavaAnalyzer:
             # Flush batch in case of error to prevent data loss
             self._flush_batch()
 
+    def merge_duplicate_packages(self) -> None:
+        """Merge JavaLeafPackage into JavaInternalPackage if they share the same name."""
+        tx = self.graph.begin()
+        try:
+            query = (
+                "MATCH (leaf:JavaLeafPackage), (internal:JavaInternalPackage) "
+                "WHERE leaf.name = internal.name "
+                "RETURN leaf, internal"
+            )
+            data = tx.run(query)
+
+            for record in data:
+                leaf_package = record["leaf"]
+                internal_package = record["internal"]
+
+                # Transfer incoming relationships (PARENT_PACKAGE, IMPORT)
+                # PARENT_PACKAGE from child to leaf -> child to internal
+                transfer_parent_query = (
+                    "MATCH (child)-[r:PARENT_PACKAGE]->(leaf:JavaLeafPackage {name: $leaf_name}) "
+                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
+                    "CREATE (child)-[:PARENT_PACKAGE]->(internal)"
+                )
+                tx.run(transfer_parent_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
+                
+                # IMPORT from other_package to leaf -> other_package to internal
+                transfer_import_to_leaf_query = (
+                    "MATCH (other)-[r:IMPORT]->(leaf:JavaLeafPackage {name: $leaf_name}) "
+                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
+                    "CREATE (other)-[:IMPORT]->(internal)"
+                )
+                tx.run(transfer_import_to_leaf_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
+
+                # Transfer outgoing relationships (IMPORT, CLASS, INTERFACE, ENUM, PARENT_PACKAGE of leaf)
+                # IMPORT from leaf to other_package -> internal to other_package
+                transfer_import_from_leaf_query = (
+                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})-[r:IMPORT]->(other) "
+                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
+                    "CREATE (internal)-[:IMPORT]->(other)"
+                )
+                tx.run(transfer_import_from_leaf_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
+                
+                # PARENT_PACKAGE from leaf to its parent_pkg -> internal to parent_pkg
+                transfer_leafs_parent_query = (
+                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})-[:PARENT_PACKAGE]->(parent_pkg) "
+                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
+                    "MERGE (internal)-[:PARENT_PACKAGE]->(parent_pkg)"
+                )
+                tx.run(transfer_leafs_parent_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
+                
+                # CLASS from leaf to class_node -> internal to class_node
+                transfer_class_query = (
+                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})<-[:CLASS]-(class_node) "
+                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
+                    "CREATE (internal)<-[:CLASS]-(class_node)"
+                )
+                tx.run(transfer_class_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
+                
+                # INTERFACE from leaf to interface_node -> internal to interface_node
+                transfer_interface_query = (
+                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})<-[:INTERFACE]-(interface_node) "
+                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
+                    "CREATE (internal)<-[:INTERFACE]-(interface_node)"
+                )
+                tx.run(transfer_interface_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
+                
+                # ENUM from leaf to enum_node -> internal to enum_node
+                transfer_enum_query = (
+                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})<-[:ENUM]-(enum_node) "
+                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
+                    "CREATE (internal)<-[:ENUM]-(enum_node)"
+                )
+                tx.run(transfer_enum_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
+
+                # Delete the JavaLeafPackage node and its relationships
+                # Detach delete ensures relationships are removed before deleting the node.
+                delete_leaf_query = (
+                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name}) "
+                    "DETACH DELETE leaf"
+                )
+                tx.run(delete_leaf_query, leaf_name=leaf_package["name"])
+
+            self.graph.commit(tx)
+            print("Duplicate packages merged successfully.")
+
+        except Exception as e:
+            if tx:
+                self.graph.rollback(tx)
+            print(f"Error merging duplicate packages: {str(e)}")
+
 def find_java_files(directory: str) -> List[str]:
     """Find all Java files in directory"""
     java_files = []

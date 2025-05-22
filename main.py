@@ -42,6 +42,8 @@ def main():
     
     for java_file in tqdm(find_java_files(directory_path)):
         analyzer.process_java_file(java_file)
+    
+    analyzer.merge_duplicate_packages()
 
 if __name__ == "__main__":
     main() 

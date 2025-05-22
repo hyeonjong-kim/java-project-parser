@@ -1,0 +1,23 @@
+server:
+  port: ${server.port}
+
+spring:
+  datasource:
+    url: ${spring.datasource.url}
+    username: ${spring.datasource.username}
+    password: ${spring.datasource.password}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    properties:
+      hibernate:
+        default_schema: ${jpa.properties.hibernate.default_schema}
+    show-sql: true
+
+logging:
+  level:
+    root: info
+

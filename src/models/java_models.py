@@ -17,28 +17,34 @@ class JavaInternalPackage(JavaPackage):
     __primarykey__ = "name"
     
     name = Property()
+    description = Property()
+    summary = Property()
     packages = RelatedFrom("JavaPackage", "CHILD_PACKAGE")
     package_by = RelatedTo("JavaPackage", "PARENT_PACKAGE")
     classes = RelatedFrom("JavaClass", "CLASS")
     interfaces = RelatedFrom("JavaInterface", "INTERFACE")
     enums = RelatedFrom("JavaEnum", "ENUM")
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, description: str = "", summary: str = ""):
         super().__init__(name)
+        self.description = description
+        self.summary = summary
 
 class JavaLeafPackage(JavaPackage):
     """Leaf package that can contain classes"""
     __primarykey__ = "name"
     
     name = Property()
-    body = Property()
     description = Property()
+    summary = Property()
     classes = RelatedFrom("JavaClass", "CLASS")
     interfaces = RelatedFrom("JavaInterface", "INTERFACE")
     enums = RelatedFrom("JavaEnum", "ENUM")
     package_by = RelatedTo("JavaPackage", "PARENT_PACKAGE")
-    def __init__(self, name: str):
+    def __init__(self, name: str, description: str = "", summary: str = ""):
         super().__init__(name)
+        self.description = description
+        self.summary = summary
 
 class JavaInterface(GraphObject):
     """Java interface representation"""
@@ -49,6 +55,7 @@ class JavaInterface(GraphObject):
     description = Property()
     summary = Property()
     extends = RelatedFrom("JavaInterface", "EXTEND")
+    methods = RelatedFrom("JavaMethod", "METHOD")
     contained_in = RelatedTo("JavaPackage", "INTERFACE")
 
     def __init__(self, name: str, body: str, description: str, summary: str):
@@ -119,19 +126,22 @@ class JavaField(GraphObject):
 
 class JavaMethod(GraphObject):
     """Java method representation"""
-    __primarykey__ = "name"
+    __primarykey__ = "signature"
     
     name = Property()
+    signature = Property()  # Added: method_name + parameter types for uniqueness
     body = Property()
     description = Property()
     summary = Property()
     return_type = Property()
     parameters = RelatedFrom("JavaParameter", "PARAMETER")
     local_variables = RelatedFrom("JavaLocalVariable", "VARIABLE")
-    contained_in = RelatedTo("JavaClass", "METHOD")
+    contained_in_class = RelatedTo("JavaClass", "METHOD")
+    contained_in_interface = RelatedTo("JavaInterface", "METHOD")
 
-    def __init__(self, name: str, body: str, description: str, summary: str, return_type: str):
+    def __init__(self, name: str, signature: str, body: str, description: str, summary: str, return_type: str):
         self.name = name
+        self.signature = signature
         self.body = body
         self.description = description
         self.summary = summary

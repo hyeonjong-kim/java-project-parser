@@ -22,11 +22,13 @@ from collections import defaultdict # Added for defaultdict
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from src.models.java_models import (
-    JavaPackage, JavaInternalPackage, JavaLeafPackage,
-    JavaClass, JavaMethod, JavaField, JavaParameter, JavaLocalVariable, JavaInterface, JavaEnum, JavaEnumConstant,
+    JavaProject,
+    JavaPackage,
+    JavaClass, JavaMethod, JavaInterface, JavaEnum,
     GraphObject # Ensure GraphObject is imported if needed for isinstance checks, though type() is used later
 )
 from src.utils.java_parser import JavaParser, walk, find_node_by_type, extract_text, parse_package_declaration, find_node_by_type_in_children
+from src.services.embedding_service import EmbeddingService
 
 class CodeExplanation(BaseModel):
     description: str = Field(..., description="자바 코드의 상세 설명 (한국어)")
@@ -36,19 +38,16 @@ class JavaAnalyzer:
     """Service for analyzing Java source code and building graph database"""
     
     NODE_TYPE_MAPPING = {
-        JavaInternalPackage: {"label": "JavaInternalPackage", "pk": "name"},
-        JavaLeafPackage: {"label": "JavaLeafPackage", "pk": "name"},
+        JavaProject: {"label": "JavaProject", "pk": "name"},
+        JavaPackage: {"label": "JavaPackage", "pk": "name"},
         JavaClass: {"label": "JavaClass", "pk": "name"},
         JavaInterface: {"label": "JavaInterface", "pk": "name"},
         JavaEnum: {"label": "JavaEnum", "pk": "name"},
-        JavaEnumConstant: {"label": "JavaEnumConstant", "pk": "constant"},
-        JavaField: {"label": "JavaField", "pk": "name"},
         JavaMethod: {"label": "JavaMethod", "pk": "signature"},
-        JavaParameter: {"label": "JavaParameter", "pk": "name"},
-        JavaLocalVariable: {"label": "JavaLocalVariable", "pk": "name"},
     }
 
-    def __init__(self, neo4j_uri: str, neo4j_user: str, neo4j_password: str, openai_api_key: str):
+    def __init__(self, neo4j_uri: str, neo4j_user: str, neo4j_password: str, openai_api_key: str, 
+                 upstage_api_key: Optional[str] = None, postgres_url: Optional[str] = None):
         self.graph = Graph(neo4j_uri, auth=(neo4j_user, neo4j_password))
         self.parser = JavaParser()
         self.batch_size = 2000  # Reduced initial batch size for better memory management
@@ -59,6 +58,21 @@ class JavaAnalyzer:
         self.llm_parser = PydanticOutputParser(pydantic_object=CodeExplanation)
         self.node_cache = {} # In-memory cache for nodes
         self.processed_files_count = 0  # Track processed files for adaptive batching
+        self.project = None  # Store the current project instance
+        self.project_root_path = None  # Store the project root directory path
+        self.internal_packages = set()  # Set of internal package names discovered from directory structure
+        
+        # Initialize embedding service if credentials are provided
+        self.embedding_service = None
+        if upstage_api_key and postgres_url:
+            try:
+                self.embedding_service = EmbeddingService(upstage_api_key, postgres_url)
+                print("Embedding service initialized successfully")
+            except Exception as e:
+                print(f"Warning: Failed to initialize embedding service: {e}")
+                print("Continuing without embedding functionality")
+        else:
+            print("Embedding service not initialized (missing upstage_api_key or postgres_url)")
     
     def _get_explanation_code(self, vertex_info: dict) -> Tuple[str, str]:
         """Get explanation of the code based on vertex_info dictionary.
@@ -69,7 +83,8 @@ class JavaAnalyzer:
         node_labels = vertex_info.get("labels", [])
 
         additional_context = ""
-        is_package_type = "JavaLeafPackage" in node_labels or "JavaInternalPackage" in node_labels
+        is_package_type = "JavaPackage" in node_labels
+        is_project_type = "JavaProject" in node_labels
 
         # Escape curly braces in user-provided content to prevent Langchain from treating them as variables
         escaped_body = body.replace("{", "{{").replace("}", "}}") if body and isinstance(body, str) else None
@@ -80,6 +95,9 @@ class JavaAnalyzer:
         elif is_package_type:
             raw_package_context = self._build_incoming_context_for_package(vertex_info)
             additional_context = raw_package_context.replace("{", "{{").replace("}", "}}")
+        elif is_project_type:
+            raw_project_context = self._build_incoming_context_for_project(vertex_info)
+            additional_context = raw_project_context.replace("{", "{{").replace("}", "}}")
 
         # Prepare variables for the prompt
         prompt_variables = {
@@ -88,17 +106,17 @@ class JavaAnalyzer:
 
         user_prompt_template_parts = []
 
-        if not is_package_type and escaped_body and escaped_body.strip():
+        if not (is_package_type or is_project_type) and escaped_body and escaped_body.strip():
             user_prompt_template_parts.append("### Java 코드\n{code}\n\n")
             prompt_variables["code"] = escaped_body # Use escaped_body for {code}
-        elif is_package_type and not (escaped_body and escaped_body.strip()): # Package type, body is not expected to be primary content
+        elif (is_package_type or is_project_type) and not (escaped_body and escaped_body.strip()): # Package/Project type, body is not expected to be primary content
             prompt_variables["code"] = "" # Provide empty string for {code} if not available but template expects it
         elif not (escaped_body and escaped_body.strip()) and not (additional_context and additional_context.strip()):
              return (
                     f"{node_name}에 대해 LLM에 전달할 유효한 내용(코드 또는 컨텍스트)이 없습니다.",
                     "설명 생성 불가 (LLM 입력 내용 없음)"
                 )
-        else: # Non-package type without body, but has context. Or other unhandled cases.
+        else: # Non-package/project type without body, but has context. Or other unhandled cases.
              prompt_variables["code"] = "" # Default for {code}
 
         if additional_context and additional_context.strip():
@@ -121,9 +139,13 @@ class JavaAnalyzer:
                 [
                     ("system",
                     "당신은 숙련된 자바 개발자입니다. "
+                    "현재 bottom-up 방식으로 코드 분석을 진행 중이므로, 이미 분석된 하위 구성 요소들의 정보를 최대한 활용하세요. "
+                    "예를 들어, 클래스 분석 시에는 이미 분석된 메서드들의 정보를, "
+                    "패키지 분석 시에는 이미 분석된 클래스들의 정보를, "
+                    "프로젝트 분석 시에는 이미 분석된 패키지들의 정보를 종합하여 설명하세요. "
                     "사용자가 제공한 내용을 읽고, 어떤 역할을 하는지 친절히 설명하고, "
                     "마지막에 한-두 줄로 핵심을 요약하세요. "
-                    "주어진 Java 코드, 추가 컨텍스트가 있다면 그것들을 모두 고려하여 설명해주세요. "
+                    "주어진 Java 코드, 추가 컨텍스트, 하위 구성 요소 정보들을 모두 고려하여 설명해주세요. "
                     "반드시 제공된 JSON 스키마에 맞춰 응답하세요."),
                     ("user", user_prompt_template)
                 ]
@@ -167,7 +189,7 @@ class JavaAnalyzer:
         context_lines = []
         context_lines.append(f"타겟 정점 '{target_name}' ({target_label}) 의 In-coming 컨텍스트:")
 
-        tx = self.graph.begin() # Use a transaction for read operations as well for consistency
+        tx = self.graph.begin()
         try:
             # Query for in-coming relationships
             # We need to match the target node using its primary label and name property.
@@ -199,6 +221,37 @@ class JavaAnalyzer:
             
             if not found_incoming:
                 context_lines.append("  (In-coming 관계가 없습니다.)")
+
+            # For bottom-up analysis, also include information about methods contained in this class
+            if target_label == "JavaClass":
+                methods_query = (
+                    "MATCH (m:JavaMethod)-[:METHOD]->(c:JavaClass {name: $target_name}) "
+                    "RETURN m.name AS method_name, m.signature AS method_signature, "
+                    "m.summary AS method_summary, m.description AS method_description "
+                    "ORDER BY m.name"
+                )
+                
+                methods_result = tx.run(methods_query, target_name=target_name)
+                methods_found = False
+                method_lines = []
+                
+                for method_record in methods_result:
+                    if not methods_found:
+                        method_lines.append("\n포함된 메서드들 (이미 분석됨):")
+                        methods_found = True
+                    
+                    method_name = method_record["method_name"]
+                    method_signature = method_record["method_signature"]
+                    method_summary = method_record.get("method_summary", "요약 없음")
+                    method_description = method_record.get("method_description", "설명 없음")
+                    
+                    method_lines.append(f"  메서드: {method_signature}")
+                    if method_summary and method_summary != "요약 없음":
+                        method_lines.append(f"    요약: {method_summary}")
+                    if method_description and method_description != "설명 없음":
+                        method_lines.append(f"    설명: {method_description[:100]}{'...' if len(method_description) > 100 else ''}")
+                
+                context_lines.extend(method_lines)
             
             # tx.commit() # Read-only, commit not strictly needed
             return "\n".join(context_lines)
@@ -259,6 +312,41 @@ class JavaAnalyzer:
             
             if not found_incoming:
                 context_lines.append("  (In-coming 관계가 없습니다.)")
+
+            # For bottom-up analysis, include information about classes/interfaces/enums contained in this package
+            contained_elements_query = (
+                "MATCH (element)-[rel]->(p:JavaPackage {name: $target_name}) "
+                "WHERE type(rel) IN ['CLASS', 'INTERFACE', 'ENUM'] "
+                "RETURN labels(element) AS element_labels, element.name AS element_name, "
+                "element.summary AS element_summary, element.description AS element_description, "
+                "type(rel) AS relation_type "
+                "ORDER BY relation_type, element.name"
+            )
+            
+            elements_result = tx.run(contained_elements_query, target_name=target_name)
+            elements_found = False
+            element_lines = []
+            
+            for element_record in elements_result:
+                if not elements_found:
+                    element_lines.append("\n포함된 요소들 (이미 분석됨):")
+                    elements_found = True
+                
+                element_name = element_record["element_name"]
+                element_labels = element_record["element_labels"]
+                relation_type = element_record["relation_type"]
+                element_summary = element_record.get("element_summary", "요약 없음")
+                element_description = element_record.get("element_description", "설명 없음")
+                
+                element_type = element_labels[0] if element_labels else "UnknownType"
+                element_lines.append(f"  {relation_type}: {element_name} ({element_type})")
+                
+                if element_summary and element_summary != "요약 없음":
+                    element_lines.append(f"    요약: {element_summary}")
+                if element_description and element_description != "설명 없음":
+                    element_lines.append(f"    설명: {element_description[:100]}{'...' if len(element_description) > 100 else ''}")
+            
+            context_lines.extend(element_lines)
             
             # tx.commit() # Read-only
             return "\n".join(context_lines)
@@ -275,6 +363,120 @@ class JavaAnalyzer:
                     # print(f"Transaction for '{target_name}' (package context) rolled back in finally.")
                 except Exception as e_tx_final:
                     print(f"Error in finally block rolling back tx for '{target_name}' (package context): {e_tx_final}")
+
+    def _build_incoming_context_for_project(self, vertex_info: dict) -> str:
+        """Builds a string context of in-coming relationships and connected nodes for a given project vertex."""
+        target_name = vertex_info.get("name")
+        target_labels = vertex_info.get("labels")
+
+        if not target_name or not target_labels:
+            return "대상 정점의 이름이나 레이블 정보가 없어 In-coming 컨텍스트를 생성할 수 없습니다."
+
+        target_label = target_labels[0] if isinstance(target_labels, (list, tuple)) and target_labels else None
+        if not target_label:
+             return f"대상 정점 '{target_name}'의 유효한 주 레이블이 없어 In-coming 컨텍스트를 생성할 수 없습니다."
+
+        context_lines = []
+        context_lines.append(f"타겟 정점 '{target_name}' ({target_label}) 의 In-coming 컨텍스트:")
+
+        tx = self.graph.begin()
+        try:
+            # For projects, we want to see what packages are contained within it
+            query = (
+                f"MATCH (s)-[r]->(t:{target_label} {{name: $target_name}}) "
+                "RETURN s.name AS source_name, labels(s) AS source_labels, type(r) AS relation_type, "
+                "s.summary AS source_summary, s.description AS source_description"
+            )
+            
+            result = tx.run(query, target_name=target_name)
+            found_incoming = False
+            for record in result:
+                found_incoming = True
+                source_name = record["source_name"]
+                source_labels_list = record["source_labels"]
+                relation_type = record["relation_type"]
+                source_summary = record.get("source_summary", "요약 정보 없음")
+                
+                display_source_label = source_labels_list[0] if source_labels_list else "UnknownLabel"
+
+                context_lines.append(
+                    f"  - '{source_name}' ({display_source_label}) --[{relation_type}]--> '{target_name}'"
+                )
+                context_lines.append(f"    요약: {source_summary if source_summary else 'N/A'}")
+            
+            if not found_incoming:
+                context_lines.append("  (In-coming 관계가 없습니다.)")
+
+            # For bottom-up analysis, include information about packages connected to this project
+            packages_query = (
+                "MATCH (pkg:JavaPackage)-[:PACKAGE]->(proj:JavaProject {name: $target_name}) "
+                "RETURN pkg.name AS package_name, pkg.is_internal AS is_internal, "
+                "pkg.summary AS package_summary, pkg.description AS package_description "
+                "ORDER BY pkg.name"
+            )
+            
+            packages_result = tx.run(packages_query, target_name=target_name)
+            packages_found = False
+            package_lines = []
+            
+            for package_record in packages_result:
+                if not packages_found:
+                    package_lines.append("\n포함된 패키지들 (이미 분석됨):")
+                    packages_found = True
+                
+                package_name = package_record["package_name"]
+                is_internal = package_record.get("is_internal", False)
+                package_summary = package_record.get("package_summary", "요약 없음")
+                package_description = package_record.get("package_description", "설명 없음")
+                
+                pkg_type = "내부" if is_internal else "외부"
+                package_lines.append(f"  패키지: {package_name} ({pkg_type})")
+                
+                if package_summary and package_summary != "요약 없음":
+                    package_lines.append(f"    요약: {package_summary}")
+                if package_description and package_description != "설명 없음":
+                    package_lines.append(f"    설명: {package_description[:100]}{'...' if len(package_description) > 100 else ''}")
+            
+            context_lines.extend(package_lines)
+
+            # Also provide a summary of the project structure
+            if packages_found:
+                summary_query = (
+                    "MATCH (pkg:JavaPackage)-[:PACKAGE]->(proj:JavaProject {name: $target_name}) "
+                    "OPTIONAL MATCH (cls:JavaClass)-[:CLASS]->(pkg) "
+                    "OPTIONAL MATCH (iface:JavaInterface)-[:INTERFACE]->(pkg) "
+                    "OPTIONAL MATCH (enum:JavaEnum)-[:ENUM]->(pkg) "
+                    "OPTIONAL MATCH (method:JavaMethod)-[:METHOD]->(cls) "
+                    "RETURN count(DISTINCT pkg) as package_count, "
+                    "count(DISTINCT cls) as class_count, "
+                    "count(DISTINCT iface) as interface_count, "
+                    "count(DISTINCT enum) as enum_count, "
+                    "count(DISTINCT method) as method_count"
+                )
+                
+                summary_result = tx.run(summary_query, target_name=target_name)
+                summary_record = list(summary_result)[0]
+                
+                context_lines.append("\n프로젝트 구조 요약:")
+                context_lines.append(f"  총 패키지: {summary_record['package_count']}개")
+                context_lines.append(f"  총 클래스: {summary_record['class_count']}개")
+                context_lines.append(f"  총 인터페이스: {summary_record['interface_count']}개")
+                context_lines.append(f"  총 열거형: {summary_record['enum_count']}개")
+                context_lines.append(f"  총 메서드: {summary_record['method_count']}개")
+            
+            # tx.commit() # Read-only
+            return "\n".join(context_lines)
+            
+        except Exception as e:
+            if tx and not tx.closed:
+                tx.rollback()
+            return f"'{target_name}' ({target_label}) 에 대한 In-coming 컨텍스트 생성 중 오류 발생: {str(e)}"
+        finally:
+            if tx and not tx.closed:
+                try:
+                    tx.rollback()
+                except Exception as e_tx_final:
+                    print(f"Error in finally block rolling back tx for '{target_name}' (project context): {e_tx_final}")
 
     def _flush_batch(self):
         """Flush pending nodes and relationships to Neo4j using UNWIND for OGM objects where possible."""
@@ -425,38 +627,38 @@ class JavaAnalyzer:
         if current_batch_size >= flush_threshold:
             self._flush_batch()
     
-    def get_or_create_package(self, package_name: str, is_leaf: bool = False) -> JavaPackage:
+    def get_or_create_project(self, project_name: str) -> JavaProject:
+        """Get existing project or create new one. Project has empty summary/description initially."""
+        cache_key = (JavaProject, project_name)
+        if cache_key in self.node_cache:
+            return self.node_cache[cache_key]
+
+        project = JavaProject.match(self.graph, project_name).first()
+        if not project:
+            project = JavaProject(project_name, description="", summary="")
+            self._add_to_batch(node=project)
+        
+        if project:  # Ensure project is not None before caching
+            self.node_cache[cache_key] = project
+            self.project = project  # Store current project instance
+        return project
+    
+    def get_or_create_package(self, package_name: str) -> JavaPackage:
         """Get existing package or create new one. Packages have empty summary/description initially."""
-        # Use a generic cache key for package name, specific type handled by instance check
         cache_key = (JavaPackage, package_name) 
         if cache_key in self.node_cache:
-            package = self.node_cache[cache_key]
-            # Check if the cached package's type is compatible with is_leaf expectation
-            if is_leaf and not isinstance(package, JavaLeafPackage):
-                print(f"Warning: Package {package_name} (cached as {type(package).__name__}) requested as JavaLeafPackage.")
-            elif not is_leaf and not isinstance(package, JavaInternalPackage):
-                print(f"Warning: Package {package_name} (cached as {type(package).__name__}) requested as JavaInternalPackage.")
-            return package
+            return self.node_cache[cache_key]
 
         package = JavaPackage.match(self.graph, package_name).first()
         if not package:
-            if is_leaf:
-                # JavaLeafPackage __init__ expects name, description="", summary=""
-                package = JavaLeafPackage(package_name, description="", summary="")
-            else:
-                # JavaInternalPackage __init__ expects name, description="", summary=""
-                package = JavaInternalPackage(package_name, description="", summary="")
+            # Determine if this is an internal package
+            is_internal = self._is_internal_package(package_name)
+            
+            package = JavaPackage(package_name, description="", summary="", is_internal=is_internal)
             self._add_to_batch(node=package)
-        # If package exists, ensure it's the correct type or handle type mismatch if necessary
-        # For now, we assume the first created type is correct.
-        # Consider adding logic to merge/update if a package is found but type is different than expected.
-        elif is_leaf and not isinstance(package, JavaLeafPackage):
-            # This case should ideally be handled by the merge_duplicate_packages logic
-            # or by ensuring consistent creation. For now, we'll just log it.
-            print(f"Warning: Package {package_name} exists as {type(package).__name__} but requested as JavaLeafPackage.")
-            # Optionally, update to JavaLeafPackage if it's currently a generic JavaPackage
-        elif not is_leaf and not isinstance(package, JavaInternalPackage):
-            print(f"Warning: Package {package_name} exists as {type(package).__name__} but requested as JavaInternalPackage.")
+            
+            # Log package type for debugging
+            package_type = "internal" if is_internal else "external"
         
         if package: # Ensure package is not None before caching
             self.node_cache[cache_key] = package
@@ -492,21 +694,6 @@ class JavaAnalyzer:
             self.node_cache[cache_key] = interface
         return interface
     
-    def get_or_create_field(self, field_name: str, type: str) -> JavaField:
-        """Get existing field or create new one"""
-        cache_key = (JavaField, field_name) # Assuming field_name is globally unique for JavaField nodes
-        if cache_key in self.node_cache:
-            return self.node_cache[cache_key]
-
-        field = JavaField.match(self.graph, field_name).first()
-        if not field:
-            field = JavaField(field_name, type)
-            self._add_to_batch(node=field)
-        
-        if field: # Ensure field is not None before caching
-             self.node_cache[cache_key] = field
-        return field
-    
     def get_or_create_method(self, method_name: str, signature: str, body: str = "", description: str = "", return_type: str = "", summary: str = "") -> JavaMethod:
         """Get existing method or create new one"""
         cache_key = (JavaMethod, signature) # Use signature for caching instead of method_name
@@ -522,51 +709,6 @@ class JavaAnalyzer:
             self.node_cache[cache_key] = method
         return method
 
-    def get_or_create_parameter(self, parameter_name: str, type: str) -> JavaParameter:
-        """Get existing parameter or create new one"""
-        cache_key = (JavaParameter, parameter_name) # Assuming parameter_name is globally unique for JavaParameter nodes
-        if cache_key in self.node_cache:
-            return self.node_cache[cache_key]
-            
-        parameter = JavaParameter.match(self.graph, parameter_name).first()
-        if not parameter:
-            parameter = JavaParameter(parameter_name, type)
-            self._add_to_batch(node=parameter)
-        
-        if parameter: # Ensure parameter is not None before caching
-            self.node_cache[cache_key] = parameter
-        return parameter
-    
-    def get_or_create_local_variable(self, local_variable_name: str, type: str) -> JavaLocalVariable:
-        """Get existing local variable or create new one"""
-        cache_key = (JavaLocalVariable, local_variable_name) # Assuming local_variable_name is globally unique
-        if cache_key in self.node_cache:
-            return self.node_cache[cache_key]
-
-        local_variable = JavaLocalVariable.match(self.graph, local_variable_name).first()
-        if not local_variable:
-            local_variable = JavaLocalVariable(local_variable_name, type)
-            self._add_to_batch(node=local_variable)
-        
-        if local_variable: # Ensure local_variable is not None before caching
-            self.node_cache[cache_key] = local_variable
-        return local_variable
-    
-    def get_or_create_enum_constant(self, constant: str) -> JavaEnumConstant:
-        """Get existing enum constant or create new one"""
-        cache_key = (JavaEnumConstant, constant) # `constant` is the primary key
-        if cache_key in self.node_cache:
-            return self.node_cache[cache_key]
-
-        enum_constant = JavaEnumConstant.match(self.graph, constant).first()
-        if not enum_constant:
-            enum_constant = JavaEnumConstant(constant)
-            self._add_to_batch(node=enum_constant)
-        
-        if enum_constant: # Ensure enum_constant is not None before caching
-            self.node_cache[cache_key] = enum_constant
-        return enum_constant
-    
     def get_or_create_enum(self, enum_name: str, body: str = "", description: str = "", summary: str = "") -> JavaEnum:
         """Get existing enum or create new one"""
         cache_key = (JavaEnum, enum_name)
@@ -582,42 +724,7 @@ class JavaAnalyzer:
             self.node_cache[cache_key] = enum
         return enum
 
-    def build_package_hierarchy(self, package_path: str) -> Tuple[Optional[JavaPackage], Optional[JavaPackage]]:
-        """Build package hierarchy from package path"""
-        if not package_path:
-            return None, None
-            
-        parts = package_path.split('.')
-        root_package = None
-        before_package = None
-        leaf_package = None
-
-        for i, part in enumerate(parts):
-            current_package_name = '.'.join(parts[:i+1])
-            
-            try:
-                if i == len(parts) - 1:
-                    leaf_package = self.get_or_create_package(current_package_name, is_leaf=True)
-                    if before_package:
-                        leaf_package.package_by.add(before_package)
-                        self._add_to_batch(node=leaf_package)
-                else:
-                    current_package = self.get_or_create_package(current_package_name)
-                    if root_package is None:
-                        root_package = current_package
-                        before_package = current_package
-                        self._add_to_batch(node=current_package)
-                    else:
-                        current_package.package_by.add(before_package)
-                        self._add_to_batch(node=current_package)
-                        before_package = current_package
-            except Exception as e:
-                print(f"Error processing package {current_package_name}: {str(e)}")
-                return None, None
-        
-        return root_package, leaf_package
-    
-    def process_imports(self, root: TreeSitterNode, leaf_package: JavaLeafPackage) -> None:
+    def process_imports(self, root: TreeSitterNode, leaf_package: JavaPackage) -> None:
         """Process import declarations"""
         for imp in (n for n in root.children if n.type == "import_declaration"):
             imp_text = extract_text(imp).strip()
@@ -652,57 +759,15 @@ class JavaAnalyzer:
                     # Single component, treat as package (though unusual)
                     package_name = fq
                 
-            # Build package hierarchy for the actual package
-            imported_root_package, imported_package = self.build_package_hierarchy(package_name)
-                
-            if imported_package: # This should be a JavaPackage (either LeafPackage or InternalPackage)
-                if isinstance(imported_package, JavaPackage):
-                    # Create import relationship between packages
-                    leaf_package.imported_by.add(imported_package)
-                    self._add_to_batch(node=leaf_package) # Mark leaf_package as needing update
-                    self._add_to_batch(node=imported_package) # Mark imported package as needing update
+            # Create or get the imported package directly
+            imported_package = self.get_or_create_package(package_name)
+            if imported_package:
+                # Create import relationship between packages
+                leaf_package.imported_by.add(imported_package)
+                self._add_to_batch(node=leaf_package) # Mark leaf_package as needing update
+                self._add_to_batch(node=imported_package) # Mark imported package as needing update
 
-    
-    def find_field_declaration(self, node: TreeSitterNode) -> JavaField:
-        """Extract field declaration information"""
-        type_name = ""
-        variable_name = ""
-        for child in walk(node):
-            if child.type == "type_identifier":
-                type_name = extract_text(child)
-            if child.type == "variable_declarator":
-                variable_name = extract_text(child)
-        return self.get_or_create_field(variable_name, type_name)
-    
-    def find_local_variable_declaration(self, node: TreeSitterNode) -> JavaLocalVariable:
-        """Extract local variable declaration information"""
-        type_name = ""
-        variable_name = ""
-        for child_node in walk(node): # Renamed child to child_node
-            if child_node.type == "type_identifier":
-                type_name = extract_text(child_node)
-            if child_node.type == "variable_declarator":
-                # Ensure there's a child node before accessing its children
-                if child_node.children:
-                    variable_name = extract_text(child_node.children[0])
-                else: # Handle cases like "int x;" where declarator itself is the name
-                    variable_name = extract_text(child_node)
-
-        return self.get_or_create_local_variable(variable_name, type_name)
-    
-    def find_formal_parameter(self, node: TreeSitterNode) -> JavaParameter:
-        """Extract formal parameter information"""
-        type_name = ""
-        variable_name = ""
-        for child in walk(node):
-            if child.type == "formal_parameter":
-                list_split = extract_text(child).split(" ")
-                type_name = list_split[0].strip()
-                variable_name = list_split[1].strip()
-                break
-        return self.get_or_create_parameter(variable_name, type_name)
-    
-    def find_extended_class(self, node: TreeSitterNode) -> List[JavaClass]:
+    def find_extended_class(self, node: TreeSitterNode) -> JavaClass:
         """Extract extended class information"""
         extended_class = None
         # tree-sitter node for superclass is "superclass"
@@ -713,7 +778,7 @@ class JavaAnalyzer:
             extended_class = self.get_or_create_class(extended_class_name) # Body will be empty for now if not in project
         return extended_class
     
-    def find_implemented_interface(self, node: TreeSitterNode) -> JavaInterface:
+    def find_implemented_interface(self, node: TreeSitterNode) -> List[JavaInterface]:
         """Extract implemented interfaces information"""
         implemented_interfaces: List[JavaInterface] = []
         for child in walk(node):
@@ -723,13 +788,13 @@ class JavaAnalyzer:
                     implemented_interfaces.append(implemented_interface)
                 break
         return implemented_interfaces
-    
+
     def _read_source_code(self, file_path: str) -> str:
         """Read source code from file"""
         with open(file_path, 'r', encoding='utf-8') as f:
             return f.read()
 
-    def _process_class_node(self, class_node: TreeSitterNode, leaf_package: JavaLeafPackage) -> None:
+    def _process_class_node(self, class_node: TreeSitterNode, leaf_package: JavaPackage) -> None:
         """Process a class declaration node"""
         body = extract_text(class_node)
         name_node = find_node_by_type_in_children(class_node, "identifier")
@@ -746,7 +811,7 @@ class JavaAnalyzer:
         for class_child_node in walk(class_node): 
             self._process_class_child_node(class_child_node, java_class, class_node)
     
-    def _process_interface_node(self, interface_node: TreeSitterNode, leaf_package: JavaLeafPackage) -> None:
+    def _process_interface_node(self, interface_node: TreeSitterNode, leaf_package: JavaPackage) -> None:
         """Process a interface declaration node"""
         body = extract_text(interface_node)
         name_node = find_node_by_type_in_children(interface_node, "identifier")
@@ -759,7 +824,7 @@ class JavaAnalyzer:
         java_interface.contained_in.add(leaf_package)
         self._add_to_batch(node=java_interface)
 
-    def _process_enum_node(self, enum_node: TreeSitterNode, leaf_package: JavaLeafPackage) -> None:
+    def _process_enum_node(self, enum_node: TreeSitterNode, leaf_package: JavaPackage) -> None:
         """Process a enum declaration node"""
         body = extract_text(enum_node)
         name_node = find_node_by_type_in_children(enum_node, "identifier")
@@ -790,12 +855,6 @@ class JavaAnalyzer:
                     java_class.implements.add(implemented_interface)
             self._add_to_batch(node=java_class) # Mark for update
 
-        elif class_child_node.type == "field_declaration" and class_child_node.parent == find_node_by_type_in_children(parent_class_node, "class_body"): # More specific parent check
-            field = self.find_field_declaration(class_child_node)
-            if field and field.name: # Ensure field and its name are valid
-                java_class.fields.add(field)
-                self._add_to_batch(node=java_class) # Mark for update
-
         elif class_child_node.type == "method_declaration" and class_child_node.parent == find_node_by_type_in_children(parent_class_node, "class_body"): # More specific parent check
             self._process_method_node(class_child_node, java_class)
 
@@ -806,29 +865,8 @@ class JavaAnalyzer:
         # Add more processing for other interface elements if needed (e.g., constant_declaration)
 
     def _process_enum_child_node(self, enum_child_node: TreeSitterNode, java_enum: JavaEnum) -> None:
-        if enum_child_node.type == "enum_constant":
-            # An enum_constant should be a child of enum_body, which is a child of enum_declaration.
-            # The `java_enum` object corresponds to the parent enum_declaration node.
-            
-            # Check proper nesting and that the constant belongs to the current java_enum
-            if (enum_child_node.parent and
-                enum_child_node.parent.type == "enum_body" and
-                enum_child_node.parent.parent and
-                enum_child_node.parent.parent.type == "enum_declaration"):
-                
-                # Ensure this constant belongs to the specific enum (java_enum) being processed.
-                # This is done by checking if the name of the grandparent enum_declaration matches java_enum.name.
-                grandparent_enum_decl_node = enum_child_node.parent.parent
-                identifier_of_grandparent_enum = find_node_by_type_in_children(grandparent_enum_decl_node, "identifier")
-
-                if identifier_of_grandparent_enum and extract_text(identifier_of_grandparent_enum) == java_enum.name:
-                    constant_name_node = find_node_by_type_in_children(enum_child_node, "identifier")
-                    if constant_name_node:
-                        constant = extract_text(constant_name_node)
-                        java_enum_constant = self.get_or_create_enum_constant(constant)
-                        java_enum.constants.add(java_enum_constant)
-                        self._add_to_batch(node=java_enum_constant)
-                        self._add_to_batch(node=java_enum)
+        # Enum constants and other enum body elements can be processed here if needed in the future
+        pass
 
     def _process_method_node(self, method_node: TreeSitterNode, owner_class_or_interface: JavaClass | JavaInterface) -> None:
         """Process a method declaration node. Owner can be JavaClass or JavaInterface."""
@@ -876,26 +914,6 @@ class JavaAnalyzer:
 
         java_method = self.get_or_create_method(method_name, signature, body=body_text_full_method, description="", summary="", return_type=return_type)
         
-        for param_node_container in walk(method_node): 
-            if param_node_container.type == "formal_parameters":
-                for param_node in param_node_container.children: # Iterate actual formal_parameter nodes
-                    if param_node.type == "formal_parameter":
-                        java_parameter = self.find_formal_parameter(param_node) # Pass the 'formal_parameter' node
-                        if java_parameter and java_parameter.name and java_parameter.type : # Ensure valid parameter
-                            self._add_to_batch(node=java_parameter)
-                            java_method.parameters.add(java_parameter)
-                            self._add_to_batch(node=java_method) # Mark method for update
-
-            elif param_node_container.type == "local_variable_declaration":
-                # Ensure local_variable_declaration is within the method_body
-                method_body_node = find_node_by_type_in_children(method_node, "block") # Assuming block is method body
-                if method_body_node and param_node_container.parent == method_body_node:
-                    java_local_variable = self.find_local_variable_declaration(param_node_container)
-                    if java_local_variable and java_local_variable.name and java_local_variable.type: # Ensure valid local var
-                        self._add_to_batch(node=java_local_variable)
-                        java_method.local_variables.add(java_local_variable)
-                        self._add_to_batch(node=java_method) # Mark method for update
-        
         if isinstance(owner_class_or_interface, JavaClass):
             owner_class_or_interface.methods.add(java_method)
             java_method.contained_in_class.add(owner_class_or_interface)
@@ -919,16 +937,14 @@ class JavaAnalyzer:
                 print(f"Warning: No package declaration found in {file_path}. Skipping.")
                 return
 
-            _, leaf_package = self.build_package_hierarchy(package_name)
+            leaf_package = self.get_or_create_package(package_name)
             if not leaf_package:
-                print(f"Warning: Could not build/get leaf package for {package_name} in {file_path}. Skipping.")
+                print(f"Warning: Could not create package for {package_name} in {file_path}. Skipping.")
                 return
             
             # Ensure leaf_package is indeed a JavaLeafPackage as expected by process_imports and others
-            if not isinstance(leaf_package, JavaLeafPackage):
+            if not isinstance(leaf_package, JavaPackage):
                 print(f"Warning: Expected JavaLeafPackage for {package_name} but got {type(leaf_package)}. Attempting to proceed.")
-                # This might indicate an issue in build_package_hierarchy or get_or_create_package if a non-leaf
-                # was returned where a leaf was expected. Or, if an internal package was misidentified as leaf.
 
             self.process_imports(root, leaf_package) # leaf_package here must be JavaLeafPackage
 
@@ -957,101 +973,17 @@ class JavaAnalyzer:
                 self._flush_batch()
 
     def merge_duplicate_packages(self) -> None:
-        """Merge JavaLeafPackage into JavaInternalPackage if they share the same name."""
-        tx = self.graph.begin()
-        try:
-            query = (
-                "MATCH (leaf:JavaLeafPackage), (internal:JavaInternalPackage) "
-                "WHERE leaf.name = internal.name "
-                "RETURN leaf, internal"
-            )
-            data = tx.run(query)
-
-            for record in data:
-                leaf_package = record["leaf"]
-                internal_package = record["internal"]
-
-                # Transfer incoming relationships (PARENT_PACKAGE, IMPORT)
-                # PARENT_PACKAGE from child to leaf -> child to internal
-                transfer_parent_query = (
-                    "MATCH (child)-[r:PARENT_PACKAGE]->(leaf:JavaLeafPackage {name: $leaf_name}) "
-                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
-                    "CREATE (child)-[:PARENT_PACKAGE]->(internal)"
-                )
-                tx.run(transfer_parent_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
-                
-                # IMPORT from other_package to leaf -> other_package to internal
-                transfer_import_to_leaf_query = (
-                    "MATCH (other)-[r:IMPORT]->(leaf:JavaLeafPackage {name: $leaf_name}) "
-                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
-                    "CREATE (other)-[:IMPORT]->(internal)"
-                )
-                tx.run(transfer_import_to_leaf_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
-
-                # Transfer outgoing relationships (IMPORT, CLASS, INTERFACE, ENUM, PARENT_PACKAGE of leaf)
-                # IMPORT from leaf to other_package -> internal to other_package
-                transfer_import_from_leaf_query = (
-                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})-[r:IMPORT]->(other) "
-                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
-                    "CREATE (internal)-[:IMPORT]->(other)"
-                )
-                tx.run(transfer_import_from_leaf_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
-                
-                # PARENT_PACKAGE from leaf to its parent_pkg -> internal to parent_pkg
-                transfer_leafs_parent_query = (
-                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})-[:PARENT_PACKAGE]->(parent_pkg) "
-                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
-                    "MERGE (internal)-[:PARENT_PACKAGE]->(parent_pkg)"
-                )
-                tx.run(transfer_leafs_parent_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
-                
-                # CLASS from leaf to class_node -> internal to class_node
-                transfer_class_query = (
-                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})<-[:CLASS]-(class_node) "
-                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
-                    "CREATE (internal)<-[:CLASS]-(class_node)"
-                )
-                tx.run(transfer_class_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
-                
-                # INTERFACE from leaf to interface_node -> internal to interface_node
-                transfer_interface_query = (
-                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})<-[:INTERFACE]-(interface_node) "
-                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
-                    "CREATE (internal)<-[:INTERFACE]-(interface_node)"
-                )
-                tx.run(transfer_interface_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
-                
-                # ENUM from leaf to enum_node -> internal to enum_node
-                transfer_enum_query = (
-                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name})<-[:ENUM]-(enum_node) "
-                    "MATCH (internal:JavaInternalPackage {name: $internal_name}) "
-                    "CREATE (internal)<-[:ENUM]-(enum_node)"
-                )
-                tx.run(transfer_enum_query, leaf_name=leaf_package["name"], internal_name=internal_package["name"])
-
-                # Delete the JavaLeafPackage node and its relationships
-                # Detach delete ensures relationships are removed before deleting the node.
-                delete_leaf_query = (
-                    "MATCH (leaf:JavaLeafPackage {name: $leaf_name}) "
-                    "DETACH DELETE leaf"
-                )
-                tx.run(delete_leaf_query, leaf_name=leaf_package["name"])
-
-            self.graph.commit(tx)
-            print("Duplicate packages merged successfully.")
-
-        except Exception as e:
-            if tx:
-                self.graph.rollback(tx)
-            print(f"Error merging duplicate packages: {str(e)}")
+        """This method is no longer needed since we only use JavaPackage."""
+        print("No duplicate package merging needed - using only JavaPackage.")
+        pass
 
     def collect_all_analyzed_vertices(self) -> List[dict]:
         """Collects all vertices with specified Java-related labels from the graph."""
-        print("Collecting all analyzed vertices (JavaMethod, JavaClass, etc.)...")
+        print("Collecting all analyzed vertices (JavaProject, JavaMethod, JavaClass, etc.)...")
         collected_vertices = []
         labels_to_collect = [
             "JavaMethod", "JavaClass", "JavaEnum", "JavaInterface",
-            "JavaInternalPackage", "JavaLeafPackage"
+            "JavaPackage", "JavaProject"
         ]
         tx = self.graph.begin()
         try:
@@ -1181,7 +1113,7 @@ class JavaAnalyzer:
             # Find package nodes with names that look like class names
             for pattern in class_patterns:
                 query = (
-                    "MATCH (p:JavaLeafPackage) "
+                    "MATCH (p:JavaPackage) "
                     "WHERE p.name =~ $pattern "
                     "RETURN p.name AS name"
                 )
@@ -1193,7 +1125,7 @@ class JavaAnalyzer:
                 for package_name in incorrect_packages:
                     print(f"Deleting incorrectly created package: {package_name}")
                     delete_query = (
-                        "MATCH (p:JavaLeafPackage {name: $package_name}) "
+                        "MATCH (p:JavaPackage {name: $package_name}) "
                         "DETACH DELETE p"
                     )
                     tx.run(delete_query, package_name=package_name)
@@ -1221,7 +1153,7 @@ class JavaAnalyzer:
             
             for class_name in common_class_names:
                 check_query = (
-                    "MATCH (p:JavaLeafPackage {name: $class_name}) "
+                    "MATCH (p:JavaPackage {name: $class_name}) "
                     "RETURN count(p) as count"
                 )
                 result = tx.run(check_query, class_name=class_name)
@@ -1232,7 +1164,7 @@ class JavaAnalyzer:
                     if records and records[0]["count"] > 0:
                         print(f"Deleting incorrectly created package: {class_name}")
                         delete_query = (
-                            "MATCH (p:JavaLeafPackage {name: $class_name}) "
+                            "MATCH (p:JavaPackage {name: $class_name}) "
                             "DETACH DELETE p"
                         )
                         tx.run(delete_query, class_name=class_name)
@@ -1267,16 +1199,12 @@ class JavaAnalyzer:
             # Create new constraints for the updated schema
             print("Creating new constraints...")
             constraints = [
+                "CREATE CONSTRAINT JavaProject_name IF NOT EXISTS FOR (pr:JavaProject) REQUIRE pr.name IS UNIQUE",
                 "CREATE CONSTRAINT JavaMethod_signature IF NOT EXISTS FOR (m:JavaMethod) REQUIRE m.signature IS UNIQUE",
                 "CREATE CONSTRAINT JavaClass_name IF NOT EXISTS FOR (c:JavaClass) REQUIRE c.name IS UNIQUE",
                 "CREATE CONSTRAINT JavaInterface_name IF NOT EXISTS FOR (i:JavaInterface) REQUIRE i.name IS UNIQUE",
                 "CREATE CONSTRAINT JavaEnum_name IF NOT EXISTS FOR (e:JavaEnum) REQUIRE e.name IS UNIQUE",
-                "CREATE CONSTRAINT JavaField_name IF NOT EXISTS FOR (f:JavaField) REQUIRE f.name IS UNIQUE",
-                "CREATE CONSTRAINT JavaParameter_name IF NOT EXISTS FOR (p:JavaParameter) REQUIRE p.name IS UNIQUE",
-                "CREATE CONSTRAINT JavaLocalVariable_name IF NOT EXISTS FOR (v:JavaLocalVariable) REQUIRE v.name IS UNIQUE",
-                "CREATE CONSTRAINT JavaEnumConstant_constant IF NOT EXISTS FOR (ec:JavaEnumConstant) REQUIRE ec.constant IS UNIQUE",
-                "CREATE CONSTRAINT JavaInternalPackage_name IF NOT EXISTS FOR (ip:JavaInternalPackage) REQUIRE ip.name IS UNIQUE",
-                "CREATE CONSTRAINT JavaLeafPackage_name IF NOT EXISTS FOR (lp:JavaLeafPackage) REQUIRE lp.name IS UNIQUE"
+                "CREATE CONSTRAINT JavaPackage_name IF NOT EXISTS FOR (p:JavaPackage) REQUIRE p.name IS UNIQUE"
             ]
             
             for constraint in constraints:
@@ -1285,11 +1213,370 @@ class JavaAnalyzer:
                 except Exception as e:
                     print(f"Error creating constraint: {constraint}, Error: {e}")
             
+            # Create indexes for efficient querying
+            print("Creating indexes...")
+            indexes = [
+                "CREATE INDEX JavaPackage_is_internal IF NOT EXISTS FOR (p:JavaPackage) ON (p.is_internal)"
+            ]
+            
+            for index in indexes:
+                try:
+                    self.graph.run(index)
+                except Exception as e:
+                    print(f"Error creating index: {index}, Error: {e}")
+            
             print("Database schema initialized successfully.")
             
         except Exception as e:
             print(f"Error initializing database schema: {e}")
             raise
+
+    def connect_top_level_packages_to_project(self) -> None:
+        """Connect only top-level internal packages (those without parent packages and is_internal=true) to the project."""
+        if not self.project:
+            print("No project found. Skipping package-to-project connection.")
+            return
+            
+        print("Connecting top-level internal packages to project...")
+        tx = self.graph.begin()
+        try:
+            # Find internal packages that are not child packages of any other package
+            query = """
+            MATCH (p:JavaPackage)
+            WHERE p.is_internal = true 
+              AND NOT EXISTS {
+                MATCH (parent:JavaPackage)-[:PARENT_PACKAGE]->(p)
+              }
+            RETURN p.name AS package_name
+            """
+            
+            result = tx.run(query)
+            top_level_internal_packages = [record["package_name"] for record in result]
+            
+            # Connect each top-level internal package to the project
+            for package_name in top_level_internal_packages:
+                connect_query = """
+                MATCH (proj:JavaProject {name: $project_name})
+                MATCH (pkg:JavaPackage {name: $package_name, is_internal: true})
+                MERGE (pkg)-[:PACKAGE]->(proj)
+                """
+                tx.run(connect_query, project_name=self.project.name, package_name=package_name)
+                print(f"Connected internal top-level package '{package_name}' to project '{self.project.name}'")
+            
+            # Also count external packages that were excluded
+            external_query = """
+            MATCH (p:JavaPackage)
+            WHERE p.is_internal = false 
+              AND NOT EXISTS {
+                MATCH (parent:JavaPackage)-[:PARENT_PACKAGE]->(p)
+              }
+            RETURN count(p) AS external_count
+            """
+            external_result = tx.run(external_query)
+            external_count = list(external_result)[0]["external_count"]
+            
+            tx.commit()
+            print(f"Successfully connected {len(top_level_internal_packages)} internal top-level packages to project.")
+            print(f"Excluded {external_count} external top-level packages from project connection.")
+            
+        except Exception as e:
+            if tx:
+                tx.rollback()
+            print(f"Error connecting packages to project: {str(e)}")
+
+    def discover_internal_packages(self, project_root_path: str) -> None:
+        """Discover internal packages by scanning the project directory structure for Java files."""
+        print(f"Discovering internal packages from project directory: {project_root_path}")
+        self.project_root_path = project_root_path
+        self.internal_packages.clear()
+        
+        # Find all Java files and extract their package declarations
+        for root, dirs, files in os.walk(project_root_path):
+            # Skip common non-source directories
+            dirs[:] = [d for d in dirs if d not in ['.git', '.gradle', '.idea', 'target', 'build', 'node_modules']]
+            
+            for file in files:
+                if file.endswith('.java'):
+                    file_path = os.path.join(root, file)
+                    try:
+                        # Read and parse the Java file to get package declaration
+                        source_code = self._read_source_code(file_path)
+                        root_node = self.parser.parse(source_code)
+                        package_name = parse_package_declaration(root_node)
+                        
+                        if package_name:
+                            self.internal_packages.add(package_name)
+                            
+                            # Also add parent packages
+                            parts = package_name.split('.')
+                            for i in range(1, len(parts)):
+                                parent_package = '.'.join(parts[:i])
+                                self.internal_packages.add(parent_package)
+                                
+                    except Exception as e:
+                        print(f"Error reading package from {file_path}: {e}")
+                        continue
+        
+        print(f"Discovered {len(self.internal_packages)} internal packages")
+        if self.internal_packages:
+            print("Sample internal packages:", list(self.internal_packages)[:5])
+
+    def _is_internal_package(self, package_name: str) -> bool:
+        """Determine if a package is internal to the project or external library."""
+        # If internal packages haven't been discovered yet, assume external for safety
+        if not self.internal_packages:
+            return False
+            
+        # Check if the package name exactly matches an internal package
+        if package_name in self.internal_packages:
+            return True
+            
+        # Check if the package is a parent of any internal package
+        # This handles cases where we import a parent package like "java.util"
+        # but the internal packages might contain "com.example.myproject.util"
+        for internal_pkg in self.internal_packages:
+            if internal_pkg.startswith(package_name + "."):
+                return True
+                
+        # Check common external library prefixes
+        external_prefixes = [
+            "java.", "javax.", "sun.", "com.sun.",
+            "org.apache.", "org.springframework.", "org.junit.",
+            "org.slf4j.", "org.hibernate.", "org.mockito.",
+            "com.fasterxml.", "com.google.", "com.amazonaws.",
+            "io.netty.", "io.swagger.", "org.json.",
+            "org.w3c.", "org.xml.", "org.omg."
+        ]
+        
+        for prefix in external_prefixes:
+            if package_name.startswith(prefix):
+                return False
+                
+        # If not explicitly internal and doesn't match external patterns,
+        # default to external for safety (external libraries are more common in imports)
+        return False
+
+    def print_package_statistics(self) -> None:
+        """Print statistics about internal vs external packages in the graph."""
+        print("\n=== Package Statistics ===")
+        tx = self.graph.begin()
+        try:
+            # Count internal packages
+            internal_query = "MATCH (p:JavaPackage {is_internal: true}) RETURN count(p) as count"
+            internal_result = tx.run(internal_query)
+            internal_count = list(internal_result)[0]["count"]
+            
+            # Count external packages  
+            external_query = "MATCH (p:JavaPackage {is_internal: false}) RETURN count(p) as count"
+            external_result = tx.run(external_query)
+            external_count = list(external_result)[0]["count"]
+            
+            # Count packages connected to project
+            connected_query = "MATCH (p:JavaPackage)-[:PACKAGE]->(proj:JavaProject) RETURN count(p) as count"
+            connected_result = tx.run(connected_query)
+            connected_count = list(connected_result)[0]["count"]
+            
+            print(f"Internal packages: {internal_count}")
+            print(f"External packages: {external_count}")
+            print(f"Total packages: {internal_count + external_count}")
+            print(f"Packages connected to project: {connected_count}")
+            
+            # Show sample internal packages connected to project
+            if connected_count > 0:
+                sample_connected_query = """
+                MATCH (p:JavaPackage)-[:PACKAGE]->(proj:JavaProject) 
+                RETURN p.name as name, p.is_internal as is_internal 
+                LIMIT 5
+                """
+                sample_connected_result = tx.run(sample_connected_query)
+                sample_connected = [(record["name"], record["is_internal"]) for record in sample_connected_result]
+                print(f"Sample packages connected to project:")
+                for name, is_internal in sample_connected:
+                    pkg_type = "INTERNAL" if is_internal else "EXTERNAL"
+                    print(f"  - {name} ({pkg_type})")
+            
+            # Show sample internal packages NOT connected to project
+            not_connected_internal_query = """
+            MATCH (p:JavaPackage {is_internal: true})
+            WHERE NOT EXISTS {
+                MATCH (p)-[:PACKAGE]->(proj:JavaProject)
+            }
+            RETURN p.name as name 
+            LIMIT 5
+            """
+            not_connected_internal_result = tx.run(not_connected_internal_query)
+            not_connected_internal = [record["name"] for record in not_connected_internal_result]
+            
+            if not_connected_internal:
+                print(f"Sample internal packages NOT connected to project:")
+                for name in not_connected_internal:
+                    print(f"  - {name} (INTERNAL, child package)")
+            
+            # Show sample external packages
+            if external_count > 0:
+                sample_external_query = "MATCH (p:JavaPackage {is_internal: false}) RETURN p.name as name LIMIT 5"
+                sample_external_result = tx.run(sample_external_query)
+                sample_external = [record["name"] for record in sample_external_result]
+                print(f"Sample external packages (not connected to project):")
+                for name in sample_external:
+                    print(f"  - {name} (EXTERNAL)")
+            
+            tx.commit()
+            
+        except Exception as e:
+            print(f"Error retrieving package statistics: {e}")
+            if tx:
+                tx.rollback()
+        print("========================\n")
+
+    def process_embeddings_for_vertices(self, vertices: List[dict], project_name: str, batch_size: int = 50) -> Tuple[int, int]:
+        """정점들의 임베딩을 생성하고 PostgreSQL에 저장합니다."""
+        if not self.embedding_service:
+            print("Embedding service not available. Skipping embedding processing.")
+            return 0, 0
+        
+        if not vertices:
+            print("No vertices to process for embeddings.")
+            return 0, 0
+        
+        print(f"Processing embeddings for {len(vertices)} vertices...")
+        
+        success_count = 0
+        error_count = 0
+        
+        # 배치 단위로 처리
+        for i in range(0, len(vertices), batch_size):
+            batch_vertices = vertices[i:i+batch_size]
+            print(f"Processing embedding batch {i//batch_size + 1}/{(len(vertices) + batch_size - 1)//batch_size} ({len(batch_vertices)} items)")
+            
+            try:
+                # 각 정점에 대해 임베딩용 텍스트 준비
+                texts = []
+                for vertex_info in batch_vertices:
+                    text = self.embedding_service.prepare_embedding_text(vertex_info)
+                    texts.append(text)
+                
+                # 배치로 임베딩 생성
+                print(f"  Creating embeddings for batch...")
+                embeddings = self.embedding_service.create_embeddings_batch(texts)
+                
+                # PostgreSQL에 저장
+                print(f"  Saving embeddings to PostgreSQL...")
+                batch_success, batch_error = self.embedding_service.save_embeddings_batch(
+                    batch_vertices, embeddings, project_name, batch_size=100
+                )
+                
+                success_count += batch_success
+                error_count += batch_error
+                
+                print(f"  Batch completed: {batch_success} success, {batch_error} errors")
+                
+            except Exception as e:
+                print(f"Error processing embedding batch {i//batch_size + 1}: {e}")
+                error_count += len(batch_vertices)
+                continue
+        
+        print(f"\nEmbedding processing completed:")
+        print(f"  Total success: {success_count}")
+        print(f"  Total errors: {error_count}")
+        
+        return success_count, error_count
+
+    def update_vertex_with_embedding_info(self, vertex_info: dict) -> dict:
+        """정점 정보에 패키지 이름과 기타 임베딩에 필요한 메타데이터를 추가합니다."""
+        enhanced_vertex = vertex_info.copy()
+        
+        node_type = vertex_info.get("labels", ["Unknown"])[0] if vertex_info.get("labels") else "Unknown"
+        node_name = vertex_info.get("name", "")
+        
+        # 패키지 정보 추가
+        if node_type in ["JavaClass", "JavaInterface", "JavaEnum"]:
+            # 클래스/인터페이스/열거형의 경우 소속 패키지 찾기
+            package_name = self._find_package_for_node(node_name, node_type)
+            enhanced_vertex["package_name"] = package_name
+        elif node_type == "JavaMethod":
+            # 메서드의 경우 소속 클래스를 통해 패키지 찾기
+            class_name = self._find_class_for_method(node_name)
+            if class_name:
+                package_name = self._find_package_for_node(class_name, "JavaClass")
+                enhanced_vertex["package_name"] = package_name
+        elif node_type == "JavaPackage":
+            enhanced_vertex["package_name"] = node_name
+        
+        return enhanced_vertex
+
+    def _find_package_for_node(self, node_name: str, node_type: str) -> Optional[str]:
+        """노드가 속한 패키지를 찾습니다."""
+        tx = self.graph.begin()
+        try:
+            if node_type == "JavaClass":
+                query = "MATCH (c:JavaClass {name: $node_name})-[:CLASS]->(p:JavaPackage) RETURN p.name as package_name"
+            elif node_type == "JavaInterface":
+                query = "MATCH (i:JavaInterface {name: $node_name})-[:INTERFACE]->(p:JavaPackage) RETURN p.name as package_name"
+            elif node_type == "JavaEnum":
+                query = "MATCH (e:JavaEnum {name: $node_name})-[:ENUM]->(p:JavaPackage) RETURN p.name as package_name"
+            else:
+                return None
+            
+            result = tx.run(query, node_name=node_name)
+            records = list(result)
+            if records:
+                return records[0]["package_name"]
+            return None
+            
+        except Exception as e:
+            print(f"Error finding package for {node_type} {node_name}: {e}")
+            return None
+        finally:
+            if tx and not tx.closed:
+                try:
+                    tx.rollback()
+                except:
+                    pass
+
+    def _find_class_for_method(self, method_signature: str) -> Optional[str]:
+        """메서드가 속한 클래스를 찾습니다."""
+        tx = self.graph.begin()
+        try:
+            query = "MATCH (m:JavaMethod {signature: $signature})-[:METHOD]->(c:JavaClass) RETURN c.name as class_name"
+            result = tx.run(query, signature=method_signature)
+            records = list(result)
+            if records:
+                return records[0]["class_name"]
+            return None
+            
+        except Exception as e:
+            print(f"Error finding class for method {method_signature}: {e}")
+            return None
+        finally:
+            if tx and not tx.closed:
+                try:
+                    tx.rollback()
+                except:
+                    pass
+
+    def get_embedding_statistics(self, project_name: Optional[str] = None) -> dict:
+        """임베딩 통계를 조회합니다."""
+        if not self.embedding_service:
+            return {"error": "Embedding service not available"}
+        
+        return self.embedding_service.get_embedding_statistics(project_name)
+
+    def search_similar_code(self, query: str, project_name: Optional[str] = None, 
+                           node_types: Optional[List[str]] = None, limit: int = 10,
+                           similarity_threshold: float = 0.7) -> List[dict]:
+        """유사한 코드를 검색합니다."""
+        if not self.embedding_service:
+            print("Embedding service not available.")
+            return []
+        
+        return self.embedding_service.search_similar_code(
+            query=query,
+            project_name=project_name,
+            node_types=node_types,
+            limit=limit,
+            similarity_threshold=similarity_threshold
+        )
 
 
 def find_java_files(directory: str) -> List[str]:
